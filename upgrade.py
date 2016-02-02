@@ -27,10 +27,11 @@
 # SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 import logging
+import tornado
+import os
 from pymongo import *
 from bson import *
 from constants import *
-import tornado.options
 from tornado.options import define, options
 
 define("apns", default=(), help="APNs address and port")
@@ -41,14 +42,21 @@ define("mongohost", default="localhost", help="MongoDB host name")
 define("mongoport", default=27017, help="MongoDB port")
 define("mongodbname", default="airnotifier", help="MongoDB database name")
 define("masterdb", default="airnotifier", help="MongoDB DB to store information")
+define("collectionprefix", default="obj_", help="Collection name prefix")
+define("appprefix", default="", help="DB name prefix")
 
 if __name__ == "__main__":
-    tornado.options.parse_config_file("airnotifier.conf")
+    curpath = os.path.dirname(os.path.realpath(__file__))
+
+    tornado.options.parse_config_file("%s/airnotifier.conf" % curpath)
     tornado.options.parse_command_line()
     mongodb = Connection(options.mongohost, options.mongoport)
     masterdb = mongodb[options.masterdb]
     version_object = masterdb['options'].find_one({'name': 'version'})
+    appprefix = options.appprefix
+
     version = version_object['value']
+
     if version < 20140315:
         apps = masterdb.applications.find()
         for app in apps:
@@ -66,7 +74,7 @@ if __name__ == "__main__":
             masterdb.applications.update({'_id': appid}, app, safe=True, upsert=True)
 
             ## Adding device to token collections
-            db = mongodb[appname]
+            db = mongodb[appprefix + appname]
             tokens = db['tokens'].find()
             for token in tokens:
                 tokenid = ObjectId(token['_id'])
@@ -95,6 +103,7 @@ if __name__ == "__main__":
                 app['wnstokenexpiry'] = ''
             masterdb.applications.update({'_id': appid}, app, safe=True, upsert=True)
         masterdb['options'].update({'name': 'version'}, {'$set': {'value': 20140720}}, safe=True, upsert=True)
+
     if version < 20140814:
         ## Don't store fullpath in db, only filename
         import os
@@ -125,6 +134,21 @@ if __name__ == "__main__":
                 app['clickatellappid'] = ''
             masterdb.applications.update({'_id': appid}, app, safe=True, upsert=True)
         masterdb['options'].update({'name': 'version'}, {'$set': {'value': 20140820}}, safe=True, upsert=True)
+
+    if version < 20151101:
+        apps = masterdb.applications.find()
+        for app in apps:
+            appname = app['shortname']
+            db = mongodb[appprefix + appname]
+            indexes = [("created", DESCENDING)]
+            print("Adding index to %s%s['tokens'].%s" % (appprefix, appname,
+                "created"))
+            db['tokens'].create_index(indexes)
+            print("Adding index to %s%s['logs'].%s" % (appprefix, appname,
+                "created"))
+            db['logs'].create_index(indexes)
+
+        masterdb['options'].update({'name': 'version'}, {'$set': {'value': 20151101}}, safe=True, upsert=True)
 
     version_object = masterdb['options'].find_one({'name': 'version'})
     version = version_object['value']

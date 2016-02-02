@@ -29,16 +29,24 @@
 from . import PushService
 from collections import deque
 from socket import socket, AF_INET, SOCK_STREAM
-import binascii
 import json
 import logging
 import struct
 import time
+import os
 from util import *
-
+from binascii import hexlify, unhexlify
 from tornado import ioloop, iostream
+import string
+import random
+
+_logger = logging.getLogger(__name__)
 
 PAYLOAD_LENGTH = 256
+
+SIMPLE_NOTIFICATION_COMMAND = 0
+ENHANCED_NOTIFICATION_COMMAND = 1
+TOKEN_LENGTH = 32
 
 apns = {
     'sandbox': ("gateway.sandbox.push.apple.com", 2195),
@@ -49,15 +57,18 @@ feedbackhost = {
     'sandbox': ("feedback.sandbox.push.apple.com", 2196),
     'production': ("feedback.push.apple.com", 2196)
 }
+def id_generator(size=4, chars=string.ascii_letters + string.digits):
+    """  string.ascii_letters + string.digits + string.punctuation """
+    return ''.join(random.choice(chars) for _ in range(size))
 
 class PayLoad(object):
-
     def __init__(self, alert=None, badge=None, sound=None, identifier=0, expiry=None, customparams=None):
         if expiry == None:
             self.expiry = long(time.time() + 60 * 60 * 24)
         else:
             self.expiry = expiry
-        self.identifier = int(identifier)
+        if not identifier:
+            self.identifier = id_generator(4)
         self.alert = alert
         self.badge = badge
         self.sound = sound
@@ -77,11 +88,14 @@ class PayLoad(object):
             alertlength = alertlength - 11 - len(str(self.badge))
             item['badge'] = int(self.badge)
 
-        if len(self.alert) > alertlength:
-            alertlength = alertlength - 3
-            item['alert'] = self.alert[:alertlength] + '...'
-        else:
+        if type(self.alert) is dict:
             item['alert'] = self.alert
+        else:
+            if len(self.alert) > alertlength:
+                alertlength = alertlength - 3
+                item['alert'] = self.alert[:alertlength] + '...'
+            else:
+                item['alert'] = self.alert
 
         payload = {'aps': item}
         if self.customparams != None:
@@ -97,9 +111,9 @@ class APNFeedback(object):
         certexists = file_exists(certfile)
         keyexists = file_exists(keyfile)
         if not certexists:
-            logging.error("Certificate file doesn't exist")
+            _logger.error("Certificate file doesn't exist")
         if not keyexists:
-            logging.error("Key file doesn't exist")
+            _logger.error("Key file doesn't exist")
         if not certexists and not keyexists:
             raise Exception("Cert or Key not exist")
         self.host = feedbackhost[env]
@@ -123,14 +137,24 @@ class APNFeedback(object):
         self.sock.close()
 
     def _on_feedback_service_connected(self):
-        logging.info("remote connected")
+        _logger.info("APNs connected")
 
     def _on_feedback_service_read_close(self, data):
         self.shutdown()
 
     def _on_feedback_service_read_streaming(self, data):
         """ Feedback """
-        pass
+        fmt = (
+            '!'
+            'I'   # expiry
+            'H'   # token length
+            '32s' # token
+        )
+        if len(data):
+            _logger.info(data)
+        else:
+            _logger.info("no data")
+
 
 class APNClient(PushService):
 
@@ -138,34 +162,50 @@ class APNClient(PushService):
         return self.connected
 
     def __init__(self, env='sandbox', certfile="", keyfile="", appname="", instanceid=0):
+        self.apnsendpoint = apns[env]
+
+        self.appname = appname
+        self.instanceid = instanceid
+        self.messages = deque()
+
         certexists = file_exists(certfile)
         keyexists = file_exists(keyfile)
         if not certexists or not keyexists:
             raise Exception("APNs certificate or key files do not exist")
-        self.apns = apns[env]
+
         self.certfile = get_filepath(certfile)
         self.keyfile = get_filepath(keyfile)
-        self.messages = deque()
-        self.reconnect = True
-	self.errors = None
-        self.ioloop = ioloop.IOLoop.instance()
-
-        self.appname = appname
-        self.instanceid = instanceid
-
+        self.sock = None
+        self.remote_stream = None
         self.connected = False
+        self.reconnect = True
+        self.ioloop = ioloop.IOLoop.instance()
+        self.errors = None
 
         self.connect()
 
-    def build_request(self):
-        pass
+    def _on_remote_connected(self):
+        self.connected = True
+        """ Callback when connected to APNs """
+        _logger.info('APNs connection: %s[%d] is online' % (self.appname, self.instanceid))
+        # Processing the messages queue
+        while self._write_to_remote_stream_from_queue():
+            continue
 
     def _on_remote_read_close(self, data):
         """ Close socket and reconnect """
         self.connected = False
-        logging.warning('%s[%d] is offline %d' % (self.appname, self.instanceid, self.reconnect))
+        _logger.warning('%s[%d] is offline. Reconnected?: %d' % (self.appname, self.instanceid, self.reconnect))
+        """
+            Command
+                | Status
+                |   | Identifier
+                |   |    |
+                #   #   ####
+        Bytes:  1   1    4
 
-        """ Something bad happened """
+        Command always 8
+        """
         status_table = {
                 0: "No erros",
                 1: "Processing error",
@@ -176,43 +216,22 @@ class APNClient(PushService):
                 6: "Invalid topic size",
                 7: "Invalid payload size",
                 8: "Invalid token",
+               10: "Shutdown",
               255: "None"}
         # The error response packet
-        """
-            Command
-                | Status
-                |   | Identifier
-                |   |    |
-                #   #   ####
-        Bytes:  1   1    4
-
-        Command always 8
-
-        Status code | Desc
-             0      | No errors
-             1      | Processing error
-             2      | Missing device token
-             3      | Missing topic
-             4      | Missing payload
-             5      | Invalid token size
-             6      | Invalid topic size
-             7      | Invalid payload size
-             8      | Invalid token
-            10      | Shutdown
-            255     | None
-        """
         self.connected = False
         if (len(data) == 0) and (self.reconnect == True):
             """
             if we get a 0 byte response and we're closing
             we should in theory just re-connect
             """
-            logging.error('0 byte response recieved. Attempting re-connect')
+            _logger.error('0 byte recieved.')
             try:
                 self.remote_stream.close()
                 self.sock.close()
+                _logger.error('Attempting re-connect...')
                 self.connect()
-            except Exception, ex:
+            except Exception as ex:
                 raise ex
             return
             """
@@ -221,10 +240,19 @@ class APNClient(PushService):
             """
 
         if len(data) != 6:
-            logging.error('response must be a 6-byte binary string.')
+            _logger.error('response must be a 6-byte binary string.')
         else:
-            (command, statuscode, identifier) = struct.unpack_from('!bbI', data, 0)
-            logging.error('%s[%d] CMD: %s Status: %s ID: %s', self.appname, self.instanceid, command, status_table[statuscode], identifier)
+            error_format = (
+                '!'  # network big-endian
+                'b'  # command, should be 8
+                'b'  # status
+                '4s'  # identifier
+            )
+            (command, statuscode, identifier) = struct.unpack_from(error_format, data, 0)
+            # command should be 8
+            _logger.error('%s[%d] Status: %s MSGID: #%s', self.appname,
+                    self.instanceid, status_table[statuscode], identifier)
+
             self.errors = "%s (ID: %s)" % (status_table[statuscode], identifier)
 
         try:
@@ -232,22 +260,14 @@ class APNClient(PushService):
             self.sock.close()
             if self.reconnect:
                 self.connect()
-        except Exception, ex:
+        except Exception as ex:
             raise ex
-
-    def _on_remote_connected(self):
-        self.connected = True
-        """ Callback when connected to APNs """
-        logging.info('APNs connection: %s[%d] is online' % (self.appname, self.instanceid))
-        # Processing the messages queue
-        while self._send_message():
-            continue
 
     def connect(self):
         """ Setup socket """
         self.sock = socket(AF_INET, SOCK_STREAM)
         self.remote_stream = iostream.SSLIOStream(self.sock, ssl_options=dict(certfile=self.certfile, keyfile=self.keyfile))
-        self.remote_stream.connect(self.apns, self._on_remote_connected)
+        self.remote_stream.connect(self.apnsendpoint, self._on_remote_connected)
         self.remote_stream.read_until_close(self._on_remote_read_close)
 
     def shutdown(self):
@@ -268,66 +288,102 @@ class APNClient(PushService):
         badge = apnsparams.get('badge', None)
         customparams = apnsparams.get('custom', None)
         pl = PayLoad(alert=kwargs['alert'], sound=sound, badge=badge, identifier=0, expiry=None, customparams=customparams)
-        self.send(token, pl)
+        self._append_to_queue(token, pl)
 
-    def send(self, deviceToken, payload):
+    def sendbulk(self, deviceToken, payload):
+        """ TODO """
+        msghead = '!bI'
+        msghead = (
+            '!'  # network big-endian
+            'b'  # command -> 2
+            'I'  # Frame length
+        )
+        itemheadfmt = (
+            'b'  # item ID
+            'I'  # item length
+        )
+        itembodyfmt = (
+            '32s' # token
+            '%ds' # payload
+            'I'   # notification identifier
+            'I'   # expiry date
+            'b'   # priority
+        ) % (payload_length, notification_id)
+
+    def getQueueLength(self):
+        return len(self.messages)
+
+    def hasError(self):
+        return self.errors is not None
+
+    def getError(self):
+        temp = self.errors
+        self.errors = None
+        return temp
+
+    def _append_to_queue(self, deviceToken, payload):
         """ Pack payload and append to message queue """
-        # logging.info("Notification through %s[%d]" % (self.appname, self.instanceid))
+        # _logger.info("Notification through %s[%d]" % (self.appname, self.instanceid))
         json = payload.json()
+        _logger.info(json)
         json_len = len(json)
-        fmt = '!bIIH32sH%ds' % json_len
-        # command = '\x00'
-        # enhanced notification has command 1
-        command = 1
+        fmt = (
+            '!'   # network big-endian
+            'b'   # command
+            '4s'  # identifier
+            'I'   # expiry
+            'H'   # token length
+            '32s' # token
+            'H'   # payload length
+            '%ds' # payload
+        ) % json_len
         """
-        Simple notification format
+        Legacy APNs format
+
+        Enhanced Notification Format
+        https://developer.apple.com/library/ios/documentation/NetworkingInternet/Conceptual/RemoteNotificationsPG/Chapters/LegacyFormat.html
 
               Command
+                 |
                  | Id (will be returned if error)
+                 |  |
                  |  |  Expiry
+                 |  |    |
                  |  |    |   Token length
+                 |  |    |    |
                  |  |    |    |   Token
-                 |  |    |    |     |  Payload length
+                 |  |    |    |     |
+                 |  |    |    |     |  PL length
+                 |  |    |    |     |     |
                  |  |    |    |     |     |    Payload
                  |  |    |    |     |     |       |
                  # #### ####  ## ######## ## ###########
         bytes    1  4    4    2     32    2      34
                               |           |
                            Big endian     |
+                                          |
                                       Big endian
 
         """
         identifier = payload.identifier
         # One day
         expiry = payload.expiry
-        tokenLength = 32
-        # logging.info(deviceToken)
-        m = struct.pack(fmt, command, identifier, expiry, tokenLength,
-                        binascii.unhexlify(deviceToken),
-                        json_len, json)
-        self.messages.append(m)
-        self.ioloop.add_callback(self._send_message)
+        _logger.info("MSGID #%s => %s" % (identifier, deviceToken))
+        frame = struct.pack(fmt, ENHANCED_NOTIFICATION_COMMAND, identifier, expiry,
+                TOKEN_LENGTH, unhexlify(deviceToken), json_len, json)
+        self.messages.append(frame)
+        # Calls the given callback on the next I/O loop iteration.
+        self.ioloop.add_callback(self._write_to_remote_stream_from_queue)
         return True
 
-    def getQueueLength(self):
-        return len(self.messages)
-
-    def hasError(self):
-	return self.errors is not None
-
-    def getError(self):
-	temp = self.errors
-	self.errors = None
-	return temp
-
-    def _send_message(self):
+    def _write_to_remote_stream_from_queue(self):
         if len(self.messages) and not self.remote_stream.closed():
             # First in first out
             msg = self.messages.popleft()
             try:
                 self.remote_stream.write(msg)
             except Exception as ex:
-                logging.exception(ex)
+                _logger.exception(ex)
                 # Push back to queue top
                 self.messages.appendleft(msg)
                 return False

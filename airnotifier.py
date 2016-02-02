@@ -44,7 +44,6 @@ from util import *
 from constants import DEVICE_TYPE_IOS, DEVICE_TYPE_ANDROID, DEVICE_TYPE_WNS, \
     DEVICE_TYPE_MPNS
 
-
 define("port", default=8801, help="Application server listen port", type=int)
 
 define("pemdir", default="pemdir", help="Directory to store pems")
@@ -52,15 +51,23 @@ define("passwordsalt", default="d2o0n1g2s0h3e1n1g", help="Being used to make pas
 define("cookiesecret", default="airnotifiercookiesecret", help="Cookie secret")
 define("debug", default=False, help="Debug mode")
 
+define("https", default=False, help="Enable HTTPS")
+define("httpscertfile", default="", help="HTTPS cert file")
+define("httpskeyfile",  default="", help="HTTPS key file")
+
 define("mongohost", default="localhost", help="MongoDB host name")
 define("mongoport", default=27017, help="MongoDB port")
 
 define("masterdb", default="airnotifier", help="MongoDB DB to store information")
-define("dbprefix", default="obj_", help="Collection name prefix")
+define("collectionprefix", default="obj_", help="Collection name prefix")
+define("dbprefix", default="app_", help="DB name prefix")
+define("appprefix", default="", help="DB name prefix")
 
 loggingconfigfile='logging.ini'
 if os.path.isfile(loggingconfigfile):
     logging.config.fileConfig(loggingconfigfile)
+
+_logger = logging.getLogger('AirNotifierApp')
 
 class AirNotifierApp(tornado.web.Application):
 
@@ -69,17 +76,17 @@ class AirNotifierApp(tornado.web.Application):
         return RouteLoader.load(dir)
 
     def get_broadcast_status(self, appname):
-	status = "Notification sent!"
-	error = False
+        status = "Notification sent!"
+        error = False
 
-	try:
-	    apns = self.services['apns'][appname][0]
-	except (IndexError, KeyError):
-	    apns = None
+        try:
+            apns = self.services['apns'][appname][0]
+        except (IndexError, KeyError):
+            apns = None
 
-	if apns is not None and apns.hasError():
-	    status = apns.getError()
-	    error = True
+        if apns is not None and apns.hasError():
+            status = apns.getError()
+            error = True
 
         return {'msg':status, 'error':error}
 
@@ -135,16 +142,16 @@ class AirNotifierApp(tornado.web.Application):
                 elif token['device'] == DEVICE_TYPE_MPNS:
                     if mpns is not None:
                         mpns.process(token=t, alert=alert, extra=extra, mpns=kwargs.get('mpns', {}))
-        except Exception, ex:
-            logging.error(ex)
+        except Exception as ex:
+            _logger.error(ex)
 
         # Now sending android notifications
         try:
             if (gcm is not None) and regids:
                 response = gcm.process(token=regids, alert=alert, extra=extra, gcm=kwargs.get('gcm', {}))
                 responsedata = response.json()
-        except Exception, ex:
-            logging.error('GCM problem: ' + str(ex))
+        except Exception as ex:
+            _logger.error('GCM problem: ' + str(ex))
 
     def __init__(self, services):
 
@@ -179,14 +186,24 @@ class AirNotifierApp(tornado.web.Application):
         assert self.masterdb.connection == self.mongodb
 
     def main(self):
-        logging.info("Starting AirNotifier server")
-        http_server = tornado.httpserver.HTTPServer(self)
+        _logger.info("Starting AirNotifier server")
+        if options.https:
+            import ssl
+            try:
+                ssl_ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+                ssl_ctx.load_cert_chain(options.httpscertfile, options.httpskeyfile)
+            except IOError:
+                print("Invalid path to SSL certificate and private key")
+                raise
+            http_server = tornado.httpserver.HTTPServer(self, ssl_options=ssl_ctx)
+        else:
+            http_server = tornado.httpserver.HTTPServer(self)
         http_server.listen(options.port)
-        logging.info("AirNotifier is running")
+        _logger.info("AirNotifier is ready")
         try:
             tornado.ioloop.IOLoop.instance().start()
         except KeyboardInterrupt:
-            logging.info("AirNotifier is quiting")
+            _logger.info("AirNotifier is quiting")
             tornado.ioloop.IOLoop.instance().stop()
 
 def init_messaging_agents():
@@ -202,7 +219,7 @@ def init_messaging_agents():
         try:
             mongodb = Connection(options.mongohost, options.mongoport)
         except Exception as ex:
-            logging.error(ex)
+            _logger.error(ex)
     masterdb = mongodb[options.masterdb]
     apps = masterdb.applications.find()
     for app in apps:
@@ -220,7 +237,7 @@ def init_messaging_agents():
                     try:
                         apn = APNClient(app['environment'], app['certfile'], app['keyfile'], app['shortname'], instanceid)
                     except Exception as ex:
-                        logging.error(ex)
+                        _logger.error(ex)
                         continue
                     services['apns'][app['shortname']].append(apn)
         ''' GCMClient setup '''
@@ -229,7 +246,7 @@ def init_messaging_agents():
             try:
                 http = GCMClient(app['gcmprojectnumber'], app['gcmapikey'], app['shortname'], 0)
             except Exception as ex:
-                logging.error(ex)
+                _logger.error(ex)
                 continue
             services['gcm'][app['shortname']].append(http)
         ''' WNS setup '''
@@ -238,7 +255,7 @@ def init_messaging_agents():
             try:
                 wns = WNSClient(masterdb, app, 0)
             except Exception as ex:
-                logging.error(ex)
+                _logger.error(ex)
                 continue
             services['wns'][app['shortname']].append(wns)
 
@@ -247,7 +264,7 @@ def init_messaging_agents():
         try:
             mpns = MPNSClient(masterdb, app, 0)
         except Exception as ex:
-            logging.error(ex)
+            _logger.error(ex)
             continue
         services['mpns'][app['shortname']].append(mpns)
         ''' clickatell '''
@@ -255,7 +272,7 @@ def init_messaging_agents():
         try:
             sms = ClickatellClient(masterdb, app, 0)
         except Exception as ex:
-            logging.error(ex)
+            _logger.error(ex)
             continue
         services['sms'][app['shortname']].append(sms)
     mongodb.close()

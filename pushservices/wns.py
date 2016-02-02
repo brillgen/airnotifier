@@ -29,10 +29,18 @@
 from . import PushService
 import requests
 from tornado.httpclient import AsyncHTTPClient
-import logging
 import time
 import xml.etree.ElementTree as ET
-from cStringIO import StringIO
+
+try:
+    from cStringIO import StringIO
+except:
+    from io import StringIO
+
+import logging
+
+_logger = logging.getLogger(__name__)
+
 try:
     register_namespace = ET.register_namespace
 except AttributeError:
